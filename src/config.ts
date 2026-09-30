@@ -44,6 +44,9 @@ export const SCREENSHOT_DIR =
 /** Базовый URL Яндекс Еды. */
 export const BASE_URL = process.env.YANDEX_EDA_BASE_URL || "https://eda.yandex.ru";
 
+/** Базовый URL Яндекс Лавки (отдельный сайт, та же сессия Яндекса). */
+export const LAVKA_URL = process.env.YANDEX_EDA_LAVKA_URL || "https://lavka.yandex.ru";
+
 /** URL страницы паспорта для авторизации. */
 export const PASSPORT_URL = "https://passport.yandex.ru/auth";
 

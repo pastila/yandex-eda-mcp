@@ -9,6 +9,7 @@ import {
   DEFAULT_TIMEOUT,
   LOGIN_TIMEOUT,
   isAutoLogin,
+  LAVKA_URL,
 } from "./config.js";
 
 /**
@@ -117,6 +118,22 @@ function isOpenByEta(deliveryTime?: string): boolean | undefined {
   if (!deliveryTime) return undefined;
   if (/мин/i.test(deliveryTime)) return true;
   return false;
+}
+
+/** «Лавка» / «Яндекс Лавка» — отдельный сайт со своим API (не retail Еды). */
+function isLavka(shop: string): boolean {
+  return /^(яндекс[\s.]*)?лавк[аиуе]$/i.test(shop.trim()) || shop.includes("lavka.yandex");
+}
+
+/** Чистит тексты Лавки: мягкие переносы, HTML-сущности и теги в названиях. */
+function lavkaText(x: any): string {
+  return String(x ?? "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;?/g, " ")
+    .replace(/&shy;?/g, "")
+    .replace(/[\u00ad\u200b]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Сколько раз максимум прокручивать поисковую выдачу для догрузки страниц. */
@@ -996,7 +1013,11 @@ export class YandexEda {
             name,
             slug,
             business: p.business,
-            url: web ? `${BASE_URL}${web}` : `${BASE_URL}/restaurant/${slug}`,
+            url: web
+              ? `${BASE_URL}${web}`
+              : /lavka/.test(String(p.link?.web || p.link?.app || ""))
+                ? LAVKA_URL
+                : `${BASE_URL}/restaurant/${slug}`,
             rating,
             deliveryTime,
             open,
@@ -1558,6 +1579,191 @@ export class YandexEda {
     return out;
   }
 
+  // --- Яндекс Лавка (lavka.yandex.ru) -----------------------------------------
+
+  /**
+   * Открывает страницу Лавки и достаёт её данные. Лавка рендерится на сервере:
+   * состояние лежит в `<script id="…-data">` (react-query + стор), а поиск иногда
+   * дозапрашивается и XHR-ом — собираем оба источника.
+   */
+  private async lavkaLoad(
+    page: Page,
+    url: string
+  ): Promise<{ queries: any[]; products: any[]; address?: string; xhr: any[] }> {
+    const xhr = await collectJson(
+      page,
+      /\/api\/v\d+\/providers\/search\//,
+      async () => {
+        await page.goto(url, { waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(3500);
+      },
+      1500
+    );
+    const state = await page.evaluate(() => {
+      const read = (id: string) => {
+        try {
+          return JSON.parse(document.getElementById(id)?.textContent || "null");
+        } catch {
+          return null;
+        }
+      };
+      return {
+        rq: read("__react_query_state__-data"),
+        store: read("storedehydratedstate-data"),
+      };
+    });
+    const cur = state.store?.currentAddress;
+    const address = [cur?.street ?? cur?.address?.street, cur?.house ?? cur?.address?.house]
+      .filter(Boolean)
+      .join(", ");
+    return {
+      queries: Array.isArray(state.rq?.queries) ? state.rq.queries : [],
+      products: Array.isArray(state.store?.products?.regular)
+        ? state.store.products.regular
+        : [],
+      address: address || undefined,
+      xhr: xhr as any[],
+    };
+  }
+
+  /** Товар Лавки → общий формат товара магазина. */
+  private lavkaProduct(p: any): ShopProduct | null {
+    const name = lavkaText(p?.longTitle ?? p?.title);
+    if (!name || p?.currentPrice == null) return null;
+    const discounted = p.oldPrice != null && p.oldPrice !== p.currentPrice;
+    return {
+      name,
+      price: discounted ? p.oldPrice : p.currentPrice,
+      promoPrice: discounted ? p.currentPrice : undefined,
+      weight: p.amount || undefined,
+      inStock: p.available,
+    };
+  }
+
+  /** Категории Лавки из каталога (есть в состоянии любой её страницы). */
+  private lavkaCategories(queries: any[]): { name: string; group: string; slug: string }[] {
+    const layout = queries.find((q) => q?.queryKey?.[0] === "CatalogLayout")?.state?.data;
+    const out: { name: string; group: string; slug: string }[] = [];
+    const seen = new Set<string>();
+    for (const section of layout?.sections || []) {
+      const group = lavkaText(section?.categoryGroup?.info?.title);
+      for (const c of section?.categories || []) {
+        const slug = c?.info?.deepLink;
+        const name = lavkaText(c?.info?.title);
+        if (!slug || !name || c.info.available === false || seen.has(slug)) continue;
+        seen.add(slug);
+        out.push({ name, group, slug });
+      }
+    }
+    // Одноимённые категории из разных групп («Рыба и морепродукты» есть и в
+    // заморозке, и в свежем) различаем названием группы.
+    const count = new Map<string, number>();
+    for (const c of out) count.set(c.name, (count.get(c.name) || 0) + 1);
+    for (const c of out) if (count.get(c.name)! > 1 && c.group) c.name = `${c.group}: ${c.name}`;
+    return out;
+  }
+
+  /** search_products для Яндекс Лавки: категории / поиск / товары категории. */
+  private async searchLavka(
+    page: Page,
+    query?: string,
+    category?: string
+  ): Promise<{
+    shop: string;
+    mode: "search" | "category" | "categories";
+    categories?: string[];
+    products?: ShopProduct[];
+    note?: string;
+  }> {
+    const shop = "Яндекс Лавка";
+    const norm = (x: string) => x.toLowerCase().replace(/ё/g, "е");
+    const collect = (list: any[]) => {
+      const out: ShopProduct[] = [];
+      const seen = new Set<string>();
+      for (const raw of list) {
+        const p = this.lavkaProduct(raw);
+        if (!p || seen.has(p.name)) continue;
+        seen.add(p.name);
+        out.push(p);
+      }
+      return out;
+    };
+
+    if (query && query.trim()) {
+      const q = query.trim();
+      const st = await this.lavkaLoad(page, `${LAVKA_URL}/search?text=${encodeURIComponent(q)}`);
+      // Порядок выдачи — в layoutItems, сами товары — в сторе/кэше ответа.
+      const byId = new Map<string, any>();
+      for (const p of st.products) byId.set(p.id, p);
+      for (const b of st.xhr) for (const p of b?.cacheProducts || []) byId.set(p.id, p);
+      const ssr = st.queries.find((x) => x?.queryKey?.[0] === "Search")?.state?.data;
+      const layouts = [...st.xhr, ssr].filter((b) => Array.isArray(b?.layoutItems));
+      // XHR-ответ полнее серверного (лимит 242 против 32) — берём самый длинный.
+      layouts.sort((a, b) => b.layoutItems.length - a.layoutItems.length);
+      const ordered = (layouts[0]?.layoutItems || [])
+        .map((li: any) => byId.get(li?.id))
+        .filter(Boolean);
+      const products = collect(ordered);
+      // Когда совпадений нет, Лавка молча подставляет «похожие» товары.
+      const stems = norm(q)
+        .split(/[^a-zа-я0-9]+/)
+        .filter((w) => w.length >= 3)
+        .map((w) => w.slice(0, Math.max(3, w.length - 2)));
+      const relevant =
+        !stems.length || products.some((p) => stems.some((s) => norm(p.name).includes(s)));
+      return {
+        shop,
+        mode: "search",
+        products,
+        note: !products.length
+          ? `В Яндекс Лавке по «${q}» ничего нет${st.address ? ` (адрес Лавки: ${st.address})` : ""}.`
+          : relevant
+            ? undefined
+            : `Точных совпадений по «${q}» в Лавке нет — это похожие товары, которые она подставила сама.`,
+      };
+    }
+
+    if (category && category.trim()) {
+      const home = await this.lavkaLoad(page, LAVKA_URL);
+      const cats = this.lavkaCategories(home.queries);
+      const want = norm(category);
+      const cat =
+        cats.find((c) => norm(c.name) === want) ||
+        cats.find((c) => norm(c.name).includes(want)) ||
+        cats.find((c) => want.includes(norm(c.name)));
+      if (!cat) {
+        return {
+          shop,
+          mode: "category",
+          categories: cats.map((c) => c.name),
+          products: [],
+          note: `Категория «${category}» в Лавке не найдена. Выбери из списка categories.`,
+        };
+      }
+      const st = await this.lavkaLoad(
+        page,
+        `${LAVKA_URL}/catalog/technical/category/${encodeURIComponent(cat.slug)}`
+      );
+      return {
+        shop,
+        mode: "category",
+        categories: cats.map((c) => c.name),
+        products: collect(st.products.filter((p) => p?.type === "good")),
+      };
+    }
+
+    const home = await this.lavkaLoad(page, LAVKA_URL);
+    const cats = this.lavkaCategories(home.queries);
+    return {
+      shop,
+      mode: "categories",
+      categories: cats.map((c) => c.name),
+      note: cats.length
+        ? undefined
+        : "Каталог Яндекс Лавки не получен — возможно, Лавка не доставляет на текущий адрес.",
+    };
+  }
+
   /**
    * Работа с магазином (retail). Без query/category — отдаёт список категорий;
    * с query — ищет товары по запросу; с category — товары этой категории.
@@ -1576,15 +1782,14 @@ export class YandexEda {
   }> {
     await this.ensureLoggedIn();
     const page = await this.page();
+    if (isLavka(shop)) return this.searchLavka(page, query, category);
     const path = await this.resolveShopPath(page, shop);
     if (!path) {
       return {
         shop,
         mode: "categories",
         categories: [],
-        note: /^(яндекс[\s.]*)?лавк[аиу]$/i.test(shop.trim())
-          ? `Яндекс Лавка — отдельный сайт (lavka.yandex.ru), через Яндекс Еду в браузере она не открывается, поэтому поиск по ней недоступен.`
-          : `Магазин «${shop}» не найден на главной. Уточни название (Пятёрочка, Магнит, Лента…) или передай его retail-URL.`,
+        note: `Магазин «${shop}» не найден на главной. Уточни название (Пятёрочка, Магнит, Лента…) или передай его retail-URL.`,
       };
     }
     const brand = (path.match(/\/retail\/([^/?]+)/) || [])[1] || "";
@@ -1668,6 +1873,13 @@ export class YandexEda {
     product: string,
     quantity = 1
   ): Promise<{ ok: boolean; message: string }> {
+    if (isLavka(shop)) {
+      return {
+        ok: false,
+        message:
+          "Корзина Яндекс Лавки пока не поддерживается: доступны только поиск и категории (search_products).",
+      };
+    }
     await this.ensureLoggedIn();
     const page = await this.page();
     const path = await this.resolveShopPath(page, shop);

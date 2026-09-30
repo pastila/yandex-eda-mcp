@@ -114,6 +114,13 @@ claude mcp add yandex-eda -- node /абсолютный/путь/к/yandex-eda-m
 | `navigate` | Перейти по пути/URL внутри сайта |
 | `debug_snapshot` | URL + текст + скриншот страницы для отладки |
 
+### Яндекс Лавка
+
+Лавка — отдельный сайт (`lavka.yandex.ru`) с той же сессией Яндекса. Через
+`search_products` с `shop: "Яндекс Лавка"` доступны список категорий, поиск и
+товары категории. Адрес у Лавки свой (последний выбранный в ней самой), а
+корзина и оформление заказа пока не поддерживаются.
+
 ### Сохранённые адреса
 
 `set_address` по умолчанию сначала ищет совпадение среди адресов, уже
@@ -169,6 +176,7 @@ set_address «Казань, Баумана 10» → нет в сохранённ
 | `YANDEX_EDA_PROFILE` | `<DATA_DIR>/profile` | Каталог профиля с авторизацией |
 | `YANDEX_EDA_SCREENSHOT_DIR` | `<DATA_DIR>/screenshots` | Куда сохранять скриншоты |
 | `YANDEX_EDA_BASE_URL` | `https://eda.yandex.ru` | Базовый URL |
+| `YANDEX_EDA_LAVKA_URL` | `https://lavka.yandex.ru` | Базовый URL Яндекс Лавки |
 | `YANDEX_EDA_TIMEOUT` | `30000` | Таймаут ожиданий, мс |
 | `YANDEX_EDA_USER_AGENT` | Chrome 131 | User-Agent |
 
