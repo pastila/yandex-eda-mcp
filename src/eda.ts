@@ -148,7 +148,8 @@ function parseFoundItems(items: any): FoundItem[] | undefined {
   };
   const out: FoundItem[] = [];
   for (const it of items) {
-    const name = textVal(it?.title ?? it?.name);
+    // У товаров Лавки в названиях мягкие переносы — убираем.
+    const name = textVal(it?.title ?? it?.name)?.replace(/\u00ad/g, "");
     if (!name) continue;
     out.push({
       name,
