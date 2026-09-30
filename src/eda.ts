@@ -119,6 +119,31 @@ function isOpenByEta(deliveryTime?: string): boolean | undefined {
   return false;
 }
 
+/** Сколько раз максимум прокручивать поисковую выдачу для догрузки страниц. */
+const SEARCH_MAX_SCROLLS = 6;
+
+/** Блюда/товары заведения из ответа общего поиска (`places[].items[]`). */
+function parseFoundItems(items: any): FoundItem[] | undefined {
+  if (!Array.isArray(items) || !items.length) return undefined;
+  const num = (x: any) => {
+    const n = Number(String(x ?? "").replace(",", "."));
+    return Number.isFinite(n) && x != null && x !== "" ? n : undefined;
+  };
+  const out: FoundItem[] = [];
+  for (const it of items) {
+    const name = textVal(it?.title ?? it?.name);
+    if (!name) continue;
+    out.push({
+      name,
+      price: num(it.decimal_price),
+      oldPrice: num(it.decimal_old_price),
+      weight: it.weight || undefined,
+      inStock: typeof it.in_stock === "number" ? it.in_stock : undefined,
+    });
+  }
+  return out.length ? out : undefined;
+}
+
 /**
  * Оценивает, насколько сохранённый адрес подходит под запрос пользователя
  * (больше — лучше, 0 — не подходит). Понимает метки (дом/работа) и совпадение
@@ -163,7 +188,19 @@ export interface Restaurant {
   open?: boolean;
   categories?: string[];
   minOrder?: string;
+  /** Блюда/товары этого заведения, совпавшие с поисковым запросом (только поиск). */
+  items?: FoundItem[];
   raw?: unknown;
+}
+
+/** Блюдо/товар из общего поиска (внутри заведения). */
+export interface FoundItem {
+  name: string;
+  price?: number;
+  /** Цена до скидки, если товар по акции. */
+  oldPrice?: number;
+  weight?: string;
+  inStock?: number;
 }
 
 /** Тип заведений для выдачи. */
@@ -832,6 +869,15 @@ export class YandexEda {
             waitUntil: "domcontentloaded",
           });
           await page.waitForTimeout(3500);
+          // Выдача постраничная (по ~20 заведений) и догружается при прокрутке.
+          for (let i = 0; i < SEARCH_MAX_SCROLLS; i++) {
+            const before = await page.evaluate(() => document.body.scrollHeight);
+            await page.mouse.wheel(0, 20000);
+            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            await page.waitForTimeout(1500);
+            const after = await page.evaluate(() => document.body.scrollHeight);
+            if (after <= before) break;
+          }
         },
         2500
       );
@@ -940,7 +986,10 @@ export class YandexEda {
           const deliveryTime =
             textVal(p.delivery?.text) ??
             lm.find((t: string) => /мин|\bч\b|\d{1,2}:\d{2}/i.test(t));
-          const web = p.link?.web ? String(p.link.web).split("?")[0] : undefined;
+          // link.web бывает и app-диплинком («eda.yandex://lavka») — берём только пути.
+          const web = String(p.link?.web || "").startsWith("/")
+            ? String(p.link.web).split("?")[0]
+            : undefined;
           // Наличие available_from = предзаказ (ещё закрыт); иначе смотрим на ETA.
           const open = p.available_from ? false : isOpenByEta(deliveryTime);
           out.push({
@@ -955,6 +1004,7 @@ export class YandexEda {
               ? p.tags.map((t: any) => t.title || t).filter(Boolean)
               : undefined,
             minOrder: textVal(p.price_category),
+            items: parseFoundItems(p.items),
           });
         }
       }
@@ -1532,7 +1582,9 @@ export class YandexEda {
         shop,
         mode: "categories",
         categories: [],
-        note: `Магазин «${shop}» не найден на главной. Уточни название (Пятёрочка, Магнит, Лента…) или передай его retail-URL.`,
+        note: /^(яндекс[\s.]*)?лавк[аиу]$/i.test(shop.trim())
+          ? `Яндекс Лавка — отдельный сайт (lavka.yandex.ru), через Яндекс Еду в браузере она не открывается, поэтому поиск по ней недоступен.`
+          : `Магазин «${shop}» не найден на главной. Уточни название (Пятёрочка, Магнит, Лента…) или передай его retail-URL.`,
       };
     }
     const brand = (path.match(/\/retail\/([^/?]+)/) || [])[1] || "";

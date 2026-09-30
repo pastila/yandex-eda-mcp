@@ -209,6 +209,65 @@ server.registerTool(
 );
 
 server.registerTool(
+  "search_items",
+  {
+    title: "Общий поиск блюд и товаров",
+    description:
+      "ОБЩИЙ поиск по всей Яндекс Еде: одним запросом находит блюда ресторанов и товары " +
+      "магазинов, доставляющих на текущий адрес («где продаётся судак», «у кого есть том ям»). " +
+      "Возвращает заведения и в каждом — совпавшие позиции с ценой, весом и ценой до скидки " +
+      "(oldPrice). Начинай с него, когда ищут конкретный продукт/блюдо, а не заведение.\n" +
+      "• Выдача не полная: по магазину показано лишь несколько совпавших товаров, и не все " +
+      "магазины попадают в общий поиск — за полным списком иди в search_products по магазину.\n" +
+      "• Для добавления в корзину: блюдо ресторана — get_menu + add_to_cart, товар магазина — add_product.\n" +
+      "Требуется заранее установленный адрес (set_address).",
+    inputSchema: {
+      query: z.string().min(1).describe("Что ищем: продукт или блюдо («судак», «том ям»)"),
+      type: z
+        .enum(["restaurant", "shop", "all"])
+        .optional()
+        .default("all")
+        .describe("all — всё (по умолч.); restaurant — только блюда ресторанов; shop — только товары магазинов"),
+      includeClosed: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("false (по умолч.) — только открытые сейчас; true — включая закрытые/предзаказ"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .default(50)
+        .describe("Максимум заведений в ответе"),
+    },
+  },
+  async ({ query, type, includeClosed, limit }) => {
+    const list = await eda.searchRestaurants(query, type, includeClosed);
+    const places = list
+      .filter((r) => r.items?.length)
+      .slice(0, limit)
+      .map((r) => ({
+        name: r.name,
+        type: r.business,
+        rating: r.rating,
+        deliveryTime: r.deliveryTime,
+        open: r.open,
+        url: r.url ?? r.slug,
+        items: r.items,
+      }));
+    if (!places.length) {
+      return fail(
+        `По «${query}» ничего не нашёл. Убедитесь, что задан адрес (set_address), ` +
+          `или поищите в конкретном магазине через search_products.`
+      );
+    }
+    return json({ query, type, count: places.length, places });
+  }
+);
+
+server.registerTool(
   "get_menu",
   {
     title: "Меню ресторана",
@@ -305,7 +364,7 @@ server.registerTool(
   {
     title: "Товары в магазине",
     description:
-      "Работа с МАГАЗИНОМ (Пятёрочка, Магнит, Лента, Лавка…) — в отличие от ресторанов, " +
+      "Работа с МАГАЗИНОМ (Пятёрочка, Магнит, Лента, ВкусВилл…; Яндекс Лавка не поддерживается) — в отличие от ресторанов, " +
       "у магазина тысячи товаров, поэтому меню не выгружают целиком, а ищут/смотрят по " +
       "категориям:\n" +
       "• без `query` и `category` → список категорий магазина (посмотреть, что есть);\n" +
